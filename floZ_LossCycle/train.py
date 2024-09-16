@@ -18,20 +18,60 @@ from sklearn.model_selection import train_test_split
 
 from .flow import Flow
 
+## Older slower non-vectorized version of pre-whitening
+# def _pre_whitening(samples):
+    
+#     cov     = np.cov(samples.T)
+#     w, v    = np.linalg.eig(cov)
+    
+#     # project samples
+#     output  = np.zeros(samples.shape)
+#     for i in range(len(w)): # run over dimensions
+#         for j in range(len(samples)): # run over samples
+#             output[j][i]  = (v[:,i]*samples[j]).sum()/np.sqrt(w[i])
+#     if np.isinf(0.5*np.log(np.abs(np.prod(w)))):
+#         return output, 0.5*np.sum(np.log(np.abs(w)))
+    
+#     return output, 0.5*np.log(np.abs(np.prod(w)))
+
+
 def _pre_whitening(samples):
+    # Compute covariance matrix of samples
+    cov_coloured = np.cov(samples.T)
     
-    cov     = np.cov(samples.T)
-    w, v    = np.linalg.eig(cov)
+    # Eigenvalue decomposition
+    w, v = np.linalg.eig(cov_coloured)
     
-    # project samples
-    output  = np.zeros(samples.shape)
-    for i in range(len(w)): # run over dimensions
-        for j in range(len(samples)): # run over samples
-            output[j][i]  = (v[:,i]*samples[j]).sum()/np.sqrt(w[i])
-    if np.isinf(0.5*np.log(np.abs(np.prod(w)))):
-        return output, 0.5*np.sum(np.log(np.abs(w)))
+    # Project samples using vectorized operations
+    output = (samples @ v) / np.sqrt(w)
     
-    return output, 0.5*np.log(np.abs(np.prod(w)))
+    log_det = 0.5 * np.sum(np.log(np.abs(w)))
+    
+    # Handle edge case where log determinant might be infinite
+    if np.isinf(log_det):
+        log_det = 0.5 * np.log(np.abs(np.prod(w))), w, v
+
+    return output, log_det, w, v
+
+
+# Reconstruct the original (coloured) samples using the eigenvector (v_colour) and eigenvalues (w_colour)
+def _re_colouring(whitened_samples, whitened_log_prob):
+    v_colour = np.loadtxt(os.path.join(self.outdir, '..', 'eigenValVec.txt'))
+    w_colour = v_colour[:,0]
+    v_colour = v_colour[:,1:]
+    means_colour = np.loadtxt(os.path.join(self.outdir, '..', 'sample_means.txt'))
+    
+    coloured_samples = (whitened_samples * np.sqrt(w_colour) @ v_colour.T) + means_colour
+    
+    # Compute the log of the Jacobian determinant for the transformation
+    log_jacobian_det = np.sum(np.log(np.sqrt(w_colour)))
+    
+    # Transform the whitened log probability to coloured log probability
+    coloured_log_prob = whitened_log_prob - log_jacobian_det
+    
+    return coloured_samples, coloured_log_prob
+
+    
 
 class Trainer:
 
@@ -121,15 +161,22 @@ class Trainer:
         self.logger.info('Number of input samples: {}'.format(self.nsamples))
         self.logger.info('Number of network parameters: {}'.format(sum(p.numel() for p in self.flow.parameters())))
         self.logger.info('Working device: {}'.format(self.device))
-            
+        
+        sample_means = np.mean(posterior_samples, axis = 0)
+        np.savetxt(os.path.join(self.outdir, '..', 'sample_means.txt'), sample_means)
+        self.logger.info('Saved sample means in {}'.format(os.path.join(self.outdir, '..', 'sample_means.txt')))
+        posterior_samples -= sample_means
+
         # pre-whitening
         if pre_whitening:
         
-            posterior_samples, log_j_white  = _pre_whitening(posterior_samples)
+            posterior_samples, log_j_white, w, v  = _pre_whitening(posterior_samples)
             log_prob                        = log_prob + log_j_white
             _new_cov                        = np.cov(posterior_samples.T)
             self.logger.info('Whitening samples with covariance error of {:.3g}'.format(np.abs(np.max(_new_cov-np.eye(self.ndim)))))
-
+            np.savetxt(os.path.join(self.outdir, '..', 'eigenValVec.txt'), np.hstack((w[:, np.newaxis], v)))
+            self.logger.info('Saved eigenvector and values in {}'.format(os.path.join(self.outdir, '..', 'eigenValVec.txt')))
+        
         # store analyzed data
         self.posterior_samples  = torch.tensor(posterior_samples, dtype=torch.float32)#.to(self.device)
         self.log_prob           = torch.tensor(log_prob, dtype=torch.float32)#.to(self.device)
