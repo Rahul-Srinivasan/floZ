@@ -25,6 +25,25 @@ def get_log_priors(samples, min_theta, max_theta):
 
 ###################### N Gaussian functions ######################
 
+def _box_probability(var, min_theta, max_theta):
+    """P(min <= X <= max) for a (frozen scipy) multivariate distribution: the rectangular integral
+    through cdf(upper, lower_limit=lower) (scipy >= 1.10); for older scipy, inclusion-exclusion over
+    the 2^d corners, which is only affordable for small d (cdf(max) - cdf(min) is right only in 1-d)."""
+    min_theta, max_theta = np.atleast_1d(min_theta).astype(float), np.atleast_1d(max_theta).astype(float)
+    d = len(min_theta)
+    try:
+        return float(var.cdf(max_theta, lower_limit=min_theta))
+    except TypeError:
+        if d > 16:
+            raise RuntimeError("box probability needs scipy >= 1.10 (cdf lower_limit) for d > 16")
+        from itertools import product
+        Z = 0.0
+        for corner in product((0, 1), repeat=d):
+            x = np.where(np.asarray(corner) == 1, max_theta, min_theta)
+            Z += (-1) ** (d - sum(corner)) * var.cdf(x)
+        return Z
+
+
 def calc_NGaussian_log_p_lnZ(N, samples, min_theta, max_theta, vars):
     likelihood = np.zeros(len(samples))
     # log_likelihood = np.zeros(len(samples))
@@ -36,7 +55,7 @@ def calc_NGaussian_log_p_lnZ(N, samples, min_theta, max_theta, vars):
         var = vars[id]
         likelihood += var.pdf(samples)
         # log_likelihood += var.logpdf(samples)
-        Z += var.cdf(max_theta) - var.cdf(min_theta)
+        Z += _box_probability(var, min_theta, max_theta)
     likelihood /= N
     ln_Z = np.log(Z) + log_prior[0] - np.log(N)
     print('ln Evidence ', ln_Z)
