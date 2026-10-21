@@ -10,7 +10,6 @@ import torch.nn.functional as F
 import math
 plt.rcParams.update({'font.size': 20})
 plt.rc('font',**{'family':'serif'})
-plt.rc('text', usetex=True)
 
 logger = logging.getLogger(__name__)
 
@@ -36,31 +35,33 @@ from .flow import Flow
 
 
 def _pre_whitening(samples):
-    # Compute covariance matrix of samples
+    """
+    Whiten the (centred) samples: y = x V / sqrt(w), with (w, V) the eigen-decomposition of the
+    sample covariance (eigh: symmetric, so V is orthogonal and the Jacobian below is exact).
+    Returns (whitened samples, log|det J| = 0.5 sum log w to be ADDED to log p, w, V).
+    The input array is not modified.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
     cov_coloured = np.cov(samples.T)
-    
-    # Eigenvalue decomposition
-    w, v = np.linalg.eig(cov_coloured)
-    
-    # Project samples using vectorized operations
+    w, v = np.linalg.eigh(cov_coloured)
+    if np.any(w <= 0) or not np.all(np.isfinite(w)):
+        raise ValueError(f"sample covariance is singular or not finite (eigenvalues {w}); "
+                         "remove constant / degenerate parameters before whitening")
     output = (samples @ v) / np.sqrt(w)
-    
-    log_det = 0.5 * np.sum(np.log(np.abs(w)))
-    
-    # Handle edge case where log determinant might be infinite
-    if np.isinf(log_det):
-        log_det = 0.5 * np.log(np.abs(np.prod(w))), w, v
-
+    log_det = 0.5 * np.sum(np.log(w))
     return output, log_det, w, v
 
 
 # Reconstruct the original (coloured) samples using the eigenvector (v_colour) and eigenvalues (w_colour)
-def _re_colouring(whitened_samples, whitened_log_prob):
-    v_colour = np.loadtxt(os.path.join(self.outdir, '..', 'eigenValVec.txt'))
-    w_colour = v_colour[:,0]
-    v_colour = v_colour[:,1:]
-    means_colour = np.loadtxt(os.path.join(self.outdir, '..', 'sample_means.txt'))
-    
+def _re_colouring(whitened_samples, whitened_log_prob, w_colour=None, v_colour=None, means_colour=None, outdir=None):
+    """Inverse of _pre_whitening (+ the mean subtraction). Pass (w, v, means) or the directory whose
+    parent holds eigenValVec.txt and sample_means.txt as written by Trainer."""
+    if w_colour is None or v_colour is None or means_colour is None:
+        if outdir is None:
+            raise ValueError("pass w_colour, v_colour, means_colour or outdir")
+        ev = np.loadtxt(os.path.join(outdir, '..', 'eigenValVec.txt'))
+        w_colour, v_colour = ev[:, 0], ev[:, 1:]
+        means_colour = np.loadtxt(os.path.join(outdir, '..', 'sample_means.txt'))
     coloured_samples = (whitened_samples * np.sqrt(w_colour) @ v_colour.T) + means_colour
     
     # Compute the log of the Jacobian determinant for the transformation
@@ -72,6 +73,26 @@ def _re_colouring(whitened_samples, whitened_log_prob):
     return coloured_samples, coloured_log_prob
 
     
+
+def _random_pairs(n, max_pairs):
+    """min(max_pairs, C(n, 2)) distinct unordered index pairs (i < j) in range(n): all of them when
+    C(n, 2) <= max_pairs, otherwise a random subset (sampling with rejection of repeats)."""
+    n = int(n); max_pairs = int(max_pairs)
+    if n < 2:
+        raise ValueError("at least two samples per batch are needed for the pair losses")
+    n_all = n * (n - 1) // 2
+    if n_all <= max_pairs:
+        return np.array(list(combinations(range(n), 2)), dtype=np.int64)
+    chosen = set()
+    while len(chosen) < max_pairs:
+        draw = np.random.randint(0, n, size=(2 * (max_pairs - len(chosen)) + 16, 2))
+        draw = draw[draw[:, 0] != draw[:, 1]]
+        draw.sort(axis=1)
+        chosen.update(map(tuple, draw))
+    pairs = np.array(list(chosen), dtype=np.int64)
+    keep = np.random.choice(len(pairs), size=max_pairs, replace=False)   # random subset, not the first in index order
+    return pairs[keep]
+
 
 class Trainer:
 
@@ -106,9 +127,13 @@ class Trainer:
         else:
             self.device = torch.device('cpu')
 
-        # check input data: samples
+        # check input data: samples (copies: the caller's arrays are never modified)
+        posterior_samples = np.array(posterior_samples, dtype=np.float64)
+        log_prob = np.array(log_prob, dtype=np.float64)
         assert len(posterior_samples) == len(log_prob)
+        assert np.all(np.isfinite(log_prob)), "log_prob must be finite (drop -inf rows first)"
         self.nsamples, self.ndim = posterior_samples.shape
+        self.shuffle_batches = bool(shuffle_batches)
 
         # check input data: output directory
         self.outdir = os.path.abspath(outdir)
@@ -135,15 +160,7 @@ class Trainer:
                                    transform_dict=transform_dict,
                                    device=torch.device('cpu'))
         
-        # Check if multiple GPUs are available
         self.logger.info('Available GPUs: {}'.format(torch.cuda.device_count()))
-        if torch.cuda.device_count() > 1:
-            self.logger.info("Using {}".format(torch.cuda.device_count(), "GPUs!"))
-            # Wrap the model in DataParallel
-            self.flow = nn.DataParallel(self.flow)
-            # Get the GPUs being used by DataParallel
-            gpus_used = model.device_ids
-            self.logger.info("GPUs being used: {}".format(gpus_used))
         if(self.device == torch.device('cpu')):
             self.logger.info("NOT using GPUs!")
 
@@ -165,7 +182,7 @@ class Trainer:
         sample_means = np.mean(posterior_samples, axis = 0)
         np.savetxt(os.path.join(self.outdir, '..', 'sample_means.txt'), sample_means)
         self.logger.info('Saved sample means in {}'.format(os.path.join(self.outdir, '..', 'sample_means.txt')))
-        posterior_samples -= sample_means
+        posterior_samples = posterior_samples - sample_means
 
         # pre-whitening
         if pre_whitening:
@@ -177,7 +194,11 @@ class Trainer:
             np.savetxt(os.path.join(self.outdir, '..', 'eigenValVec.txt'), np.hstack((w[:, np.newaxis], v)))
             self.logger.info('Saved eigenvector and values in {}'.format(os.path.join(self.outdir, '..', 'eigenValVec.txt')))
         
-        # store analyzed data
+        # store analyzed data. log_prob is stored in float32 after subtracting its maximum (float32 keeps
+        # ~7 digits: without the offset a log p of 1e4 would be rounded to 1e-3); _get_logz_from_samples
+        # adds the offset back, so log zeta is in the original units.
+        self.log_prob_offset    = float(np.max(log_prob))
+        log_prob                = log_prob - self.log_prob_offset
         self.posterior_samples  = torch.tensor(posterior_samples, dtype=torch.float32)#.to(self.device)
         self.log_prob           = torch.tensor(log_prob, dtype=torch.float32)#.to(self.device)
 
@@ -207,10 +228,8 @@ class Trainer:
         if  len(self.posterior_samples) <= 2e5:
             train_tensor = train_tensor.to(self.device)
         train_dataset   = torch.utils.data.TensorDataset(train_tensor)
-        if(shuffle_batches):
-            seed = int(time.time())
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+        self._train_tensor = train_tensor                       # for the per-epoch reshuffle (see _train_batches)
+        self._batch_size   = n_train_batches
 
         # # Hyperparameters
         # num_workers = 4  # Adjust number of worker threads based on your CPU
@@ -274,17 +293,46 @@ class Trainer:
         self.validation_loss_3b_history = []
         
         self.evidence_error     = np.inf
-        self.best               = { 'valid_loss'  : float('inf'),
+        self.valid_logz_std_history = []
+        self.best               = { 'valid_logz_std': float('inf'),
+                                    'valid_loss'  : float('inf'),
                                     'train_loss'  : float('inf'),
                                     'epoch'       : 0,
                                     'flow'        : copy.deepcopy(self.flow)
                                     }
 
+    def _train_batches(self):
+        """(data, prob) batches for one epoch; reshuffled every epoch when shuffle_batches is set
+        (previously the batches were drawn once at construction and reused for all epochs)."""
+        if not self.shuffle_batches:
+            yield from zip(self.train_loader_data, self.train_loader_prob)
+            return
+        x = self._train_tensor
+        perm = torch.randperm(len(x), device=x.device)
+        for chunk in torch.split(x[perm], self._batch_size):
+            yield chunk[:, :-1], chunk[:, -1]
+
+    def _valid_logz_std(self):
+        """std of log zeta = log p - log q on the validation set: the flow-misfit measure used for model
+        selection and patience. It does not depend on the loss phase of the cycle nor on an additive
+        constant in log p (the validation loss does, see train())."""
+        self.flow.eval()
+        with torch.no_grad():
+            lz = []
+            for data, prob in zip(self.valid_loader_data, self.valid_loader_prob):
+                if data.device != self.device:
+                    data, prob = data.to(self.device), prob.to(self.device)
+                lz.append(prob - self.flow.log_prob(data))
+            lz = torch.cat(lz)
+        self.flow.train()
+        return float(lz.std())
+
     def _get_logz_from_samples(self):
+        """log zeta_i = log p_i - log q_i for all input samples (training + validation), original units"""
         self.flow.eval()
         with torch.no_grad():
             if len(self.posterior_samples)<=2e5:
-                return self.log_prob - self.flow.log_prob(self.posterior_samples)
+                return self.log_prob - self.flow.log_prob(self.posterior_samples) + self.log_prob_offset
         
             num_batches = 10
             batch_len = len(self.posterior_samples)//num_batches
@@ -296,8 +344,8 @@ class Trainer:
             # print('posterior samples device: ', self.posterior_samples.device)
             flow_prob = np.zeros(len(self.posterior_samples))
             for i in range(len(batch_idx)-1):
-                flow_prob[batch_idx[i] : batch_idx[i+1]] = self.flow.log_prob(self.posterior_samples[batch_idx[i] : batch_idx[i+1]].clone().detach().requires_grad_(True).to(self.device)).cpu().detach().numpy()
-        return self.log_prob - flow_prob
+                flow_prob[batch_idx[i] : batch_idx[i+1]] = self.flow.log_prob(self.posterior_samples[batch_idx[i] : batch_idx[i+1]].to(self.device)).cpu().numpy()
+        return self.log_prob - torch.as_tensor(flow_prob, dtype=self.log_prob.dtype, device=self.log_prob.device) + self.log_prob_offset
         
     
     def _train(self):
@@ -322,7 +370,9 @@ class Trainer:
              if((self.lossseq)%4 == 2 or (self.lossseq)%4 == 3):
                 l3_calc = True
         
-        for batch_idx, (data,prob) in enumerate(zip(self.train_loader_data,  self.train_loader_prob)):
+        n_batches = 0
+        for data, prob in self._train_batches():
+            n_batches += 1
             if  data.device != self.device:
                 data = data.to(self.device)
                 prob = prob.to(self.device)
@@ -342,7 +392,9 @@ class Trainer:
             train_loss_1 += loss_1.item()
             train_loss_2 += loss_2.item()
             
-            # Compute loss3 if l3_calc is true
+            # Compute loss3 if l3_calc is true. Note: this is the symmetrised variant of the paper's
+            # L3 (|ln rho| = |ln zeta_i - ln zeta_j| instead of rho = zeta_i/zeta_j); both vanish
+            # only when zeta is constant over the samples.
             if l3_calc:
                 lnR = log_z[self.train_pairs[:,0]] - log_z[self.train_pairs[:,1]]
                 lnR = lnR.abs()
@@ -365,7 +417,7 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
             
-        return train_loss / len(self.train_loader_data), train_loss_1 / len(self.train_loader_data), train_loss_2 / len(self.train_loader_data), train_loss_3a / len(self.train_loader_data), train_loss_3b / len(self.train_loader_data)
+        return train_loss / n_batches, train_loss_1 / n_batches, train_loss_2 / n_batches, train_loss_3a / n_batches, train_loss_3b / n_batches
         
     def _validate(self):
 
@@ -436,7 +488,8 @@ class Trainer:
               tolerance          = 0.,
               log_interval       = 100,
               l2                 = 0,
-              flag_plot          = True):
+              flag_plot          = True,
+              max_pairs          = 500000):
 
         # define flow
         self.logger.info('Output directory: {}'.format(self.outdir))
@@ -467,15 +520,12 @@ class Trainer:
                 torch.save(self.flow.state_dict(), os.path.join(self.outdir, 'flow_state.pt'))
                 
                 self.logger.info('Creating pairs')
-                A = np.arange(0,len(self.train_loader_prob[-1]), 1)
-                A1 = np.random.choice(A, min(int(1e4), len(A)), replace = False)
-                pairs = np.array(list(combinations(A1, 2)))
-                self.train_pairs = pairs
-                
-                B = np.arange(0,len(self.valid_loader_data[-1]), 1)
-                B1 = np.random.choice(B, min(int(1e4*len(B)/len(A)), len(B)), replace = False)
-                pairs = np.array(list(combinations(B1, 2)))
-                self.validation_pairs = pairs
+                # random pairs of positions within a batch (the smallest batch bounds the index), at most
+                # max_pairs of them: all C(n, 2) combinations are ~5e7 pairs for n = 1e4 and equivalent
+                n_train = min(len(b) for b in self.train_loader_prob)
+                n_valid = min(len(b) for b in self.valid_loader_prob)
+                self.train_pairs = _random_pairs(n_train, max_pairs)
+                self.validation_pairs = _random_pairs(n_valid, max(1, int(max_pairs * n_valid / max(n_train, 1))))
                 self.logger.info('Pairs created')
                 self.logger.info('Train pair shape {}'.format(self.train_pairs.shape))
                 self.logger.info('Validation pair shape {}'.format(self.validation_pairs.shape))
@@ -511,18 +561,20 @@ class Trainer:
             self.train_loss_3b_history.append(train_loss_3b)
 
             
-            self.evidence_error = self._get_logz_from_samples().detach().cpu().numpy().std()
-            self.evidence_mean = self._get_logz_from_samples().detach().cpu().numpy().mean()
+            # Model selection and patience on the scatter of log zeta over the validation set: the
+            # validation loss itself changes meaning with the phase of the loss cycle (L1 > 0, L2 shifts
+            # one-to-one with any constant added to log p, L3b is invariant), so comparing it across
+            # epochs picked an epoch that depended on the normalisation of log p.
+            self.evidence_error = self._valid_logz_std()
+            self.valid_logz_std_history.append(self.evidence_error)
+            if self.evidence_error < self.best['valid_logz_std']:
+                count_patience              = 0
+                self.best['epoch']          = epoch
+                self.best['valid_logz_std'] = self.evidence_error
+                self.best['valid_loss']     = validation_loss
+                self.best['train_loss']     = train_loss
+                self.best['flow']           = copy.deepcopy(self.flow)
 
-            # Reset patience counter if validation loss decreases.
-            if (validation_loss < self.best['valid_loss']):
-                if validation_loss < self.best['valid_loss']:
-                    count_patience      = 0
-                self.best['epoch']       = epoch
-                self.best['valid_loss']  = validation_loss
-                self.best['train_loss']  = train_loss
-                self.best['flow']        = copy.deepcopy(self.flow)
-                
             count_patience += 1
                 
             if epoch == 1 or epoch % log_interval == 0:  
@@ -533,25 +585,24 @@ class Trainer:
                     reserved = torch.cuda.memory_reserved()
                     self.logger.info(f"GPU memory: Allocated {allocated / 1024**3:.2f} GB, Reserved {reserved / 1024**3:.2f} GB")
 
-                self.logger.info('> Epoch {} - train loss {:.5f} - valid loss {:.5f} - best valid loss {:.5f}'.format(epoch,
-                                                                                                                      train_loss,
-                                                                                                                      validation_loss,
-                                                                                                                      self.best['valid_loss']))
+                self.logger.info('> Epoch {} - train loss {:.5f} - valid loss {:.5f} - std(log zeta) valid {:.5f} - best {:.5f} (epoch {})'.format(
+                    epoch, train_loss, validation_loss, self.evidence_error, self.best['valid_logz_std'], self.best['epoch']))
             # Check if patience has exceeded.
             if count_patience > patience:
                 self.logger.info('Ran out of patience ({}) at epoch {}'.format(patience, epoch))
                 break
 
-            # Check if tollerance reached
-            if self.evidence_error/self.evidence_mean < np.log(tolerance):
-                self.logger.info('Reached requested log_e (tolerance) ({}<{}) at epoch {}'.format(self.evidence_error/self.evidence_mean, np.log(tolerance), epoch))
+            # Check if tolerance reached (tolerance = 0 switches the check off)
+            if tolerance > 0 and self.evidence_error < tolerance:
+                self.logger.info('Reached requested tolerance on std(log zeta) ({:.4g} < {:.4g}) at epoch {}'.format(self.evidence_error, tolerance, epoch))
                 break
 
         end_training_time = time.time()
         self.logger.info('Completing training of neural network')
 
         self.flow.load_state_dict(self.best['flow'].state_dict())
-        self.logger.info('Best epoch ({}): train loss {:.5f} - validation loss {:.5f}'.format(self.best['epoch'], self.best['train_loss'], self.best['valid_loss']))
+        self.logger.info('Best epoch ({}): std(log zeta) valid {:.5f} - train loss {:.5f} - validation loss {:.5f}'.format(
+            self.best['epoch'], self.best['valid_logz_std'], self.best['train_loss'], self.best['valid_loss']))
 
         training_time     = end_training_time-start_training_time
         training_time_min = int(training_time/60)
@@ -566,7 +617,8 @@ class Trainer:
         # Compute the log_z from flow. Note: Does NOT include post-processing step of chosing the 1sigma B ellipsoid.
         logz = self._get_logz_from_samples()
         self.logz = logz.detach().cpu().numpy()
-        self.logger.info('Estimated logZ with ratio: {:.5f} ± {:.5f}'.format(logz.median(), logz.std()))
+        self.logger.info('Estimated logZ with ratio: median {:.5f}, scatter (std of log zeta, a flow-misfit measure, '
+                         'not a standard error) {:.5f}'.format(logz.median(), logz.std()))
 
         # Save data, model
         self.logger.info('Saving output data')
@@ -582,8 +634,8 @@ class Trainer:
 
 
     # Function to load floZ state
-    def _load_data(self):
-        self.flow.load_state_dict(torch.load(os.path.join(zflowpath, 'flow_state.pt')))
+    def _load_data(self, zflowpath=None):
+        self.flow.load_state_dict(torch.load(os.path.join(zflowpath or self.outdir, 'flow_state.pt'), map_location=self.device))
         self.flow.eval()
 
     
